@@ -5,7 +5,9 @@ from pathlib import Path
 
 import jsonschema
 import pytest
-from app.models import FeedbackRequest, FeedbackResponse
+from pydantic import ValidationError
+
+from app.models import ErrorDetail, FeedbackRequest, FeedbackResponse
 
 SCHEMA_DIR = Path(__file__).parent.parent / "schema"
 EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
@@ -123,3 +125,39 @@ class TestExamplesMatchSchemas:
         schema = load_schema("response.schema.json")
         for example in load_examples():
             jsonschema.validate(example["expected_response"], schema)
+
+
+class TestPydanticModels:
+    def test_request_disallows_extra_fields(self):
+        with pytest.raises(ValidationError):
+            FeedbackRequest(
+                sentence="Hola",
+                target_language="Spanish",
+                native_language="English",
+                extra_field="not_allowed",
+            )
+
+    def test_error_type_enum_enforced(self):
+        with pytest.raises(ValidationError):
+            ErrorDetail(
+                original="x",
+                correction="y",
+                error_type="bad_type",
+                explanation="test",
+            )
+
+    def test_response_consistency_enforced(self):
+        with pytest.raises(ValidationError):
+            FeedbackResponse(
+                corrected_sentence="Hola",
+                is_correct=True,
+                errors=[
+                    {
+                        "original": "x",
+                        "correction": "y",
+                        "error_type": "grammar",
+                        "explanation": "test",
+                    }
+                ],
+                difficulty="A1",
+            )

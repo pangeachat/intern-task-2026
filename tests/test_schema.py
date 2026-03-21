@@ -14,11 +14,13 @@ EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
 
 
 def load_schema(name: str) -> dict:
-    return json.loads((SCHEMA_DIR / name).read_text())
+    return json.loads((SCHEMA_DIR / name).read_text(encoding="utf-8"))
 
 
 def load_examples() -> list[dict]:
-    return json.loads((EXAMPLES_DIR / "sample_inputs.json").read_text())
+    return json.loads(
+        (EXAMPLES_DIR / "sample_inputs.json").read_text(encoding="utf-8")
+    )
 
 
 class TestRequestSchema:

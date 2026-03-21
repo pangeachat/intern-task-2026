@@ -50,19 +50,19 @@
   {
     "description": "Japanese sentence with particle error",
     "request": {
-      "sentence": "私は東京を住んでいます。",
+      "sentence": "\u79c1\u306f\u6771\u4eac\u3092\u4f4f\u3093\u3067\u3044\u307e\u3059\u3002",
       "target_language": "Japanese",
       "native_language": "English"
     },
     "expected_response": {
-      "corrected_sentence": "私は東京に住んでいます。",
+      "corrected_sentence": "\u79c1\u306f\u6771\u4eac\u306b\u4f4f\u3093\u3067\u3044\u307e\u3059\u3002",
       "is_correct": false,
       "errors": [
         {
-          "original": "を",
-          "correction": "に",
+          "original": "\u3092",
+          "correction": "\u306b",
           "error_type": "grammar",
-          "explanation": "The verb 住む (to live) takes the particle に to indicate location of residence, not を. Think of に as marking where you exist/live."
+          "explanation": "The verb \u4f4f\u3080 (to live) takes the particle \u306b to indicate location of residence, not \u3092. Think of \u306b as marking where you exist/live."
         }
       ],
       "difficulty": "A2"
@@ -85,12 +85,12 @@
   {
     "description": "Portuguese sentence with spelling and word choice errors",
     "request": {
-      "sentence": "Eu quero comprar um prezente para minha irmã, mas não sei o que ela gosta.",
+      "sentence": "Eu quero comprar um prezente para minha irm\u00e3, mas n\u00e3o sei o que ela gosta.",
       "target_language": "Portuguese",
       "native_language": "English"
     },
     "expected_response": {
-      "corrected_sentence": "Eu quero comprar um presente para minha irmã, mas não sei do que ela gosta.",
+      "corrected_sentence": "Eu quero comprar um presente para minha irm\u00e3, mas n\u00e3o sei do que ela gosta.",
       "is_correct": false,
       "errors": [
         {

@@ -275,3 +275,41 @@ async def test_feedback_cache_prevents_duplicate_llm_calls():
 
     assert first == second
     assert instance.chat.completions.create.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_feedback_recovers_from_missing_and_extra_llm_fields():
+    # Simulates a common real-model drift:
+    # - missing top-level corrected_sentence and difficulty
+    # - nested extra key in error object
+    mock_response = {
+        "is_correct": False,
+        "errors": [
+            {
+                "original": "を",
+                "correction": "に",
+                "error_type": "grammar",
+                "explanation": "Use に with 住む.",
+                "difficulty": "A2",
+            }
+        ],
+    }
+
+    with patch("app.feedback.AsyncOpenAI") as mock_client:
+        instance = mock_client.return_value
+        instance.chat.completions.create = AsyncMock(
+            return_value=_mock_completion(mock_response)
+        )
+
+        request = FeedbackRequest(
+            sentence="私は東京を住んでいます。",
+            target_language="Japanese",
+            native_language="English",
+        )
+        result = await get_feedback(request)
+
+    assert result.is_correct is False
+    assert result.difficulty == "A2"
+    assert result.corrected_sentence
+    assert len(result.errors) == 1
+    assert result.errors[0].correction == "に"

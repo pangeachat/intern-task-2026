@@ -148,7 +148,25 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Service name is `feedback-api` and server is exposed on port `8000`.
+### Run tests
+
+```bash
+# Unit tests (no API key needed)
+pytest tests/test_feedback_unit.py tests/test_schema.py -v
+
+# Integration tests (requires API key in .env)
+pytest tests/test_feedback_integration.py -v
+```
+
+## How to Submit
+
+1. **Fork** this repository
+2. Replace the sample implementation with your own
+3. Make sure `docker compose up` works and passes the health check
+4. Push to your fork
+5. **Fill out the [submission form](https://forms.gle/ukcypgRiMgGhvnBh8)** with your name, email, and the link to your fork
+
+**Use the same email you applied with on Handshake.** This is how we match your submission to your application.
 
 ---
 

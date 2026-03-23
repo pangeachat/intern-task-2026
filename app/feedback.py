@@ -1,67 +1,275 @@
 """System prompt and LLM interaction for language feedback."""
 
+import asyncio
 import json
+import os
+import time
+from typing import Any
 
-from openai import AsyncOpenAI
+from fastapi import HTTPException
+from openai import APIConnectionError, APIError, APITimeoutError, AsyncOpenAI, RateLimitError
 
 from app.models import FeedbackRequest, FeedbackResponse
 
 SYSTEM_PROMPT = """\
-You are a language-learning assistant. A student is practicing writing in their \
-target language. Your job is to analyze their sentence, find errors, and provide \
-helpful feedback.
+You are an expert multilingual writing tutor.
+Return feedback for ONE learner sentence in strict JSON only.
 
-RULES:
-1. If the sentence is already correct, return is_correct=true, an empty errors \
-array, and set corrected_sentence to the original sentence exactly.
-2. For each error, identify the original text, provide the correction, classify \
-the error type, and explain the error in the learner's NATIVE language so they \
-can understand.
-3. Error types must be one of: grammar, spelling, word_choice, punctuation, \
-word_order, missing_word, extra_word, conjugation, gender_agreement, \
-number_agreement, tone_register, other.
-4. Assign a CEFR difficulty level (A1–C2) based on the complexity of the \
-sentence (vocabulary, grammar structures used), NOT based on whether it has errors.
-5. The corrected_sentence should be the minimal correction -- preserve the \
-learner's original meaning and style as much as possible.
-6. Explanations should be concise (1–2 sentences), friendly, and educational.
+GOAL:
+- Minimize edits and preserve learner voice.
+- Identify real linguistic errors only.
+- Explain each error in the learner's native language.
 
-Respond with valid JSON matching this exact schema:
-{
-  "corrected_sentence": "string",
-  "is_correct": boolean,
-  "errors": [
-    {
-      "original": "string",
-      "correction": "string",
-      "error_type": "string",
-      "explanation": "string (in native language)"
-    }
-  ],
-  "difficulty": "A1|A2|B1|B2|C1|C2"
-}
+OUTPUT RULES (must follow exactly):
+1) If the sentence is already correct:
+   - "is_correct": true
+   - "errors": []
+   - "corrected_sentence": EXACTLY the original sentence (same script/punctuation).
+2) If there are errors:
+   - "is_correct": false
+   - "errors": one item per meaningful issue.
+3) "error_type" must be one of:
+   grammar, spelling, word_choice, punctuation, word_order, missing_word,
+   extra_word, conjugation, gender_agreement, number_agreement, tone_register, other
+4) "difficulty" must be one of: A1, A2, B1, B2, C1, C2
+   and reflects sentence complexity, not correctness.
+5) "original" and "correction" should be short spans, not full-sentence rewrites.
+6) "explanation" must be concise, friendly, and in the native language.
+7) Never include markdown fences, prose outside JSON, or extra keys.
 """
 
+MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.1"))
+MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "700"))
+MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "1"))
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("OPENAI_REQUEST_TIMEOUT_SECONDS", "12"))
+ENDPOINT_TIMEOUT_SECONDS = float(os.getenv("FEEDBACK_TOTAL_TIMEOUT_SECONDS", "28"))
+CACHE_TTL_SECONDS = int(os.getenv("FEEDBACK_CACHE_TTL_SECONDS", "300"))
 
-async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
-    client = AsyncOpenAI()
+_response_cache: dict[tuple[str, str, str], tuple[float, FeedbackResponse]] = {}
+VALID_ERROR_TYPES = {
+    "grammar",
+    "spelling",
+    "word_choice",
+    "punctuation",
+    "word_order",
+    "missing_word",
+    "extra_word",
+    "conjugation",
+    "gender_agreement",
+    "number_agreement",
+    "tone_register",
+    "other",
+}
+VALID_DIFFICULTIES = {"A1", "A2", "B1", "B2", "C1", "C2"}
 
+
+def _cache_key(request: FeedbackRequest) -> tuple[str, str, str]:
+    return (
+        request.sentence.strip(),
+        request.target_language.strip().lower(),
+        request.native_language.strip().lower(),
+    )
+
+
+def _normalize_feedback(
+    request: FeedbackRequest, llm_payload: dict[str, Any]
+) -> FeedbackResponse:
+    normalized_payload = dict(llm_payload)
+
+    raw_errors = normalized_payload.get("errors")
+    sanitized_errors = _sanitize_errors(raw_errors, request.sentence)
+    has_errors = len(sanitized_errors) > 0
+
+    corrected_sentence = normalized_payload.get("corrected_sentence")
+    if not isinstance(corrected_sentence, str) or not corrected_sentence.strip():
+        corrected_sentence = _build_fallback_correction(request.sentence, sanitized_errors)
+
+    difficulty = _coerce_difficulty(
+        normalized_payload.get("difficulty"), raw_errors=raw_errors
+    )
+
+    if has_errors:
+        normalized_payload["is_correct"] = False
+    else:
+        normalized_payload["is_correct"] = True
+        corrected_sentence = request.sentence
+
+    normalized_payload["errors"] = sanitized_errors
+    normalized_payload["corrected_sentence"] = corrected_sentence
+    normalized_payload["difficulty"] = difficulty
+
+    return FeedbackResponse(**normalized_payload)
+
+
+def _sanitize_errors(raw_errors: Any, sentence: str) -> list[dict[str, str]]:
+    if not isinstance(raw_errors, list):
+        return []
+
+    sanitized: list[dict[str, str]] = []
+    for index, error in enumerate(raw_errors):
+        if not isinstance(error, dict):
+            continue
+
+        original = _string_or_default(error.get("original"), sentence)
+        correction = _string_or_default(error.get("correction"), sentence)
+        explanation = _string_or_default(
+            error.get("explanation"), "See corrected sentence."
+        )
+        error_type = _coerce_error_type(error.get("error_type"))
+
+        # Avoid duplicate low-value errors generated by some models.
+        if original == correction and index > 0:
+            continue
+
+        sanitized.append(
+            {
+                "original": original,
+                "correction": correction,
+                "error_type": error_type,
+                "explanation": explanation,
+            }
+        )
+    return sanitized
+
+
+def _coerce_error_type(value: Any) -> str:
+    if isinstance(value, str):
+        candidate = value.strip().lower()
+        if candidate in VALID_ERROR_TYPES:
+            return candidate
+    return "other"
+
+
+def _coerce_difficulty(value: Any, raw_errors: Any) -> str:
+    if isinstance(value, str):
+        candidate = value.strip().upper()
+        if candidate in VALID_DIFFICULTIES:
+            return candidate
+
+    if isinstance(raw_errors, list):
+        for error in raw_errors:
+            if not isinstance(error, dict):
+                continue
+            candidate = error.get("difficulty")
+            if isinstance(candidate, str):
+                candidate_upper = candidate.strip().upper()
+                if candidate_upper in VALID_DIFFICULTIES:
+                    return candidate_upper
+
+    return "A1"
+
+
+def _build_fallback_correction(sentence: str, errors: list[dict[str, str]]) -> str:
+    corrected = sentence
+    for error in errors:
+        original = error["original"]
+        replacement = error["correction"]
+        if original and replacement and original in corrected:
+            corrected = corrected.replace(original, replacement, 1)
+    return corrected
+
+
+def _string_or_default(value: Any, default: str) -> str:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return stripped
+    return default
+
+
+def _extract_json(response_content: Any) -> dict[str, Any]:
+    if response_content is None:
+        raise ValueError("Model returned empty response")
+    if not isinstance(response_content, str):
+        raise ValueError("Model response content was not a JSON string")
+    return json.loads(response_content)
+
+
+async def _request_feedback_from_llm(
+    client: AsyncOpenAI, request: FeedbackRequest
+) -> FeedbackResponse:
     user_message = (
         f"Target language: {request.target_language}\n"
         f"Native language: {request.native_language}\n"
         f"Sentence: {request.sentence}"
     )
 
-    response = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.2,
-    )
+    attempts = MAX_RETRIES + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            response = await client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message},
+                ],
+                response_format={"type": "json_object"},
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
 
-    content = response.choices[0].message.content
-    data = json.loads(content)
-    return FeedbackResponse(**data)
+            content = response.choices[0].message.content
+            payload = _extract_json(content)
+            return _normalize_feedback(request, payload)
+        except (
+            APITimeoutError,
+            APIConnectionError,
+            RateLimitError,
+            APIError,
+            TimeoutError,
+            asyncio.TimeoutError,
+        ) as exc:
+            if attempt == attempts:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"LLM provider request failed after retries: {exc}",
+                ) from exc
+            await asyncio.sleep(0.4 * attempt)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"LLM returned invalid JSON payload: {exc}",
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Unexpected LLM provider error: {exc}",
+            ) from exc
+
+    raise HTTPException(status_code=502, detail="LLM request failed")
+
+
+async def _get_feedback_uncached(request: FeedbackRequest) -> FeedbackResponse:
+    client = AsyncOpenAI()
+    return await _request_feedback_from_llm(client, request)
+
+
+async def _get_feedback_cached(request: FeedbackRequest) -> FeedbackResponse:
+    key = _cache_key(request)
+    now = time.time()
+    cached = _response_cache.get(key)
+    if cached and now - cached[0] <= CACHE_TTL_SECONDS:
+        return cached[1]
+
+    feedback = await _get_feedback_uncached(request)
+    _response_cache[key] = (now, feedback)
+    return feedback
+
+
+async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
+    try:
+        return await asyncio.wait_for(
+            _get_feedback_cached(request), timeout=ENDPOINT_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="Feedback generation exceeded timeout budget",
+        ) from exc
+
+
+def _clear_cache_for_tests() -> None:
+    """Reset in-memory cache for deterministic unit tests."""
+    _response_cache.clear()
